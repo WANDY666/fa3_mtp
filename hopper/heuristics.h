@@ -11,8 +11,10 @@ inline bool should_pack_gqa(bool varlen_q, int seqlen_q, int qhead_per_khead, in
     if (varlen_q) return true;
     // Heuristic: PackGQA is a bit slower but can help if seqlen_q is small or not near a multiple of kBlockM
     auto round_up = [](int a, int b) { return (a + b - 1) / b * b; };
-    float nopack_gqa_efficiency = float(seqlen_q) / float(round_up(seqlen_q, blockM));
-    float pack_gqa_efficiency = float(seqlen_q * qhead_per_khead) / float(round_up(seqlen_q * qhead_per_khead, blockM));
+    // 1 / 64
+    float nopack_gqa_efficiency = float(seqlen_q) / float(round_up(seqlen_q, blockM)); 
+    // (1 * 16) / (64)
+    float pack_gqa_efficiency = float(seqlen_q * qhead_per_khead) / float(round_up(seqlen_q * qhead_per_khead, blockM)); // 
     return nopack_gqa_efficiency < 0.9 * pack_gqa_efficiency;
 };
 
@@ -22,6 +24,7 @@ inline bool should_pack_gqa(bool varlen_q, int seqlen_q, int qhead_per_khead, in
 // splits as that would incur more HBM reads/writes.
 // So we find the best efficiency, then find the smallest number of splits that gets 85%
 // of the best efficiency.
+// total_mblocks = 1, num_SMs = 132, num_n_blocks = 132, num_m_blocks = 132, size_one_kv_head = 8446 * 1152, is_causal_or_local = false, max_splits = 128
 inline int num_splits_heuristic(int total_mblocks, int num_SMs, int num_n_blocks, int num_m_blocks, int size_one_kv_head, bool is_causal_or_local, int max_splits) {
     // If we have enough to almost fill the SMs, then just use 1 split
     // However, in the case of super long seqlen where each head of KV doesn't even fit into
@@ -38,7 +41,7 @@ inline int num_splits_heuristic(int total_mblocks, int num_SMs, int num_n_blocks
     }
     // If num_n_blocks is too small, use 1 split. For example, we never split for hdim = 128 and seqlen_k = 512.
     if (num_n_blocks <= 4) { return 1; }
-    max_splits = std::min({max_splits, num_SMs, num_n_blocks});
+    max_splits = std::min({max_splits, num_SMs, num_n_blocks}); 
     float max_efficiency = 0.f;
     std::vector<float> efficiency;
     efficiency.reserve(max_splits);

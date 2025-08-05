@@ -435,7 +435,7 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, varlen, params.softcap > 0.f, params.knew_ptr);
     int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
     int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
-    int seqlen_q_packgqa = params.seqlen_q * (params.h / params.h_k);
+    int seqlen_q_packgqa = params.seqlen_q * (params.h / params.h_k); // 16
     // If is_local, we're not going to load all of seqlen_k
     int const seqlen_k_loaded = !params.is_local
         ? params.seqlen_k
@@ -448,6 +448,7 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     // We assume the case where there's 1 long sequence and the rest are short, i.e. pretending
     // that batch = 1.
     int total_mblocks = (params.num_splits_dynamic_ptr ? 1 : params.b) * params.h_k * num_m_blocks;
+    // 1, 132, 132, 1, 8446 * 1152, false, 128
     return num_splits_heuristic(total_mblocks, params.num_sm, num_n_blocks, num_m_blocks, size_one_kv_head, params.is_causal || params.is_local, 128);
     #endif
 }
