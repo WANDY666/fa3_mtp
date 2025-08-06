@@ -84,6 +84,7 @@ struct CollectiveMainloopFwdSm90 {
     static_assert(!(!MmaPV_is_RS && Transpose_V), "MmaPV must be RS if Transpose_V");
 
     // Slightly faster in this case to have WG1 use RS instead of SS to avoid waiting for the P smem write
+    // true
     static constexpr bool MmaPV_use_RS_WG1 = !MmaPV_is_RS && kHeadDim == 64 && kHeadDimV == 512;
 
     using AtomLayoutQK = Layout<Shape<Int<kBlockM / 64>, _1, _1>>;
@@ -1813,6 +1814,30 @@ struct CollectiveMainloopFwdSm90 {
         return true; // 返回true表示成功完成计算
     }  // mma函数结束
 
+    /**
+     * mma_pv - 执行注意力权重矩阵P和值矩阵V的矩阵乘法运算 (P@V)
+     * 
+     * 这是Flash Attention算法中的关键函数，专门处理较大头维度的情况。
+     * 在这种情况下，计算被分割到不同的warp group中：
+     * - warp group 1: 执行 Q@K^T 和 Softmax 计算，生成注意力权重P
+     * - warp group 2: 执行 P@V 乘法，计算最终的注意力输出O
+     * 
+     * @tparam SharedStorage 共享内存存储类型
+     * @tparam FrgTensorO 输出张量fragment类型，必须驻留在寄存器内存中
+     * @tparam Softmax softmax操作类型
+     * 
+     * @param params 主循环参数，包含各种配置信息
+     * @param pipeline_v V矩阵的流水线，用于异步数据传输
+     * @param smem_pipe_read 共享内存流水线读取状态
+     * @param tOrO 输出张量O的fragment，存储最终的注意力结果
+     * @param softmax softmax操作对象，用于处理注意力权重的缩放
+     * @param thread_idx 当前线程在warp group中的索引
+     * @param seqlen_info 序列长度信息，用于处理变长序列和掩码
+     * @param block_coord 当前处理的块坐标 (m_block, n_block, batch_id, split_idx)
+     * @param shared_storage 共享内存存储区域
+     * 
+     * @return bool 返回true表示成功完成计算，false表示由于掩码等原因跳过计算
+     */
     template <typename SharedStorage, typename FrgTensorO, typename Softmax>
     CUTLASS_DEVICE bool
     mma_pv(Params const& params,
@@ -1825,83 +1850,136 @@ struct CollectiveMainloopFwdSm90 {
            cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
            SharedStorage& shared_storage
            ) {
+        // 确保输出张量O驻留在寄存器内存中以获得最佳性能
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
-        // can't use auto [m_block, ...] = block_coord since structured binding cannot be captured in lambda
-        int const m_block = get<0>(block_coord);
-        int const bidb = get<2>(block_coord);
-        int const split_idx = get<3>(block_coord);
+        
+        // === 解析块坐标信息 ===
+        // 不能使用结构化绑定，因为lambda表达式无法捕获结构化绑定的变量
+        int const m_block = get<0>(block_coord);      // 行块索引（query block）
+        int const bidb = get<2>(block_coord);         // batch索引
+        int const split_idx = get<3>(block_coord);    // 分割索引（用于split-k优化）
+        
+        // === 计算有效的列块范围 ===
+        // 根据因果掩码、局部注意力窗口、变长序列等约束确定需要处理的key块范围
         auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
             params.qhead_per_khead_divmod);
-        // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
+        
+        // === 提前终止检查 ===
+        // 如果没有有效的key块需要处理，直接返回
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) { return false; }
         }
 
-        Tensor sV = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVtMma{});
-        Tensor sP = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_p.data()), SmemLayoutP{});
-        Tensor sScale = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_scale.data()), SmemLayoutScale{});
+        // === 设置共享内存张量视图 ===
+        // 创建指向共享内存中V矩阵、P矩阵和缩放因子的张量视图
+        Tensor sV = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVtMma{});  // V矩阵（转置后用于MMA）
+        Tensor sP = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_p.data()), SmemLayoutP{});      // P矩阵（softmax输出的注意力权重）
+        Tensor sScale = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_scale.data()), SmemLayoutScale{}); // 缩放因子
+        
+        // === 设置warp group级别的MMA布局 ===
+        // 计算warp group数量并创建线程布局
         static constexpr int MmaWarpGroups = size(TiledMmaPV{}) / cutlass::NumThreadsPerWarpGroup;
         Layout warp_group_thread_layout = make_layout(make_shape(Int<MmaWarpGroups>{}),
                                                       make_stride(Int<cutlass::NumThreadsPerWarpGroup>{}));
 
+        // 获取当前线程所属的warp group索引
         int warp_group_idx = __shfl_sync(0xFFFFFFFF, thread_idx / cutlass::NumThreadsPerWarpGroup, 0);
-        TiledMmaPV tiled_mma_pv;
+        
+        // === 创建P@V矩阵乘法的tiled MMA对象 ===
+        TiledMmaPV tiled_mma_pv;  // P*V矩阵乘法的MMA配置
         auto wg_mma_pv = tiled_mma_pv.get_slice(warp_group_thread_layout(warp_group_idx));
 
-        // Allocate "fragments/descriptors"
-        Tensor tOrV = wg_mma_pv.partition_fragment_B(sV);
-        Tensor tOsP = wg_mma_pv.partition_fragment_A(sP);
+        // === 分配矩阵fragments ===
+        // 为当前warp group分配V矩阵和P矩阵的fragment
+        Tensor tOrV = wg_mma_pv.partition_fragment_B(sV);   // V矩阵fragment（作为乘法的右操作数B）
+        Tensor tOsP = wg_mma_pv.partition_fragment_A(sP);   // P矩阵fragment（作为乘法的左操作数A）
 
-        // For load scales to smem, pretend thread_idx is thread_idx % 128
+        // === 设置输出累加器和缩放因子加载 ===
+        // 为缩放因子加载创建线程级别的MMA slice（假设thread_idx为128取模以适应warp group）
         auto thread_mma_pv = tiled_mma_pv.get_thread_slice(thread_idx % cutlass::NumThreadsPerWarpGroup);
         Tensor taccOcO = thread_mma_pv.partition_C(cute::make_identity_tensor(select<0, 1>(TileShape_MNK_PV{})));
+        
+        // 转换累加器布局为行列格式以便于缩放操作
         Tensor taccOcO_rowcol = make_tensor(taccOcO.data(), flash::convert_layout_acc_rowcol(taccOcO.layout()));
-        Tensor taccOcO_row = taccOcO_rowcol(_, _0{});
+        Tensor taccOcO_row = taccOcO_rowcol(_, _0{});  // 提取行维度用于缩放
+        
+        // === Lambda函数：从共享内存加载缩放因子 ===
         auto load_scales = [&](auto& scales, int stage) {
             static_assert(CUTE_STATIC_V(size(scales)) == CUTE_STATIC_V(size(taccOcO_row)));
             #pragma unroll
             for (int mi = 0; mi < size(taccOcO_row); ++mi) {
-                scales(mi) = sScale(get<0>(taccOcO_row(mi)), stage);
+                scales(mi) = sScale(get<0>(taccOcO_row(mi)), stage);  // 从对应stage加载缩放因子
             }
         };
 
-        // clear(tOrO);
-        // tiled_mma_pv.accumulate_ = GMMA::ScaleOut::Zero;
+        // === 初始化输出张量（已在外部清零） ===
+        // clear(tOrO);  // 输出张量在外部已经初始化
+        // tiled_mma_pv.accumulate_ = GMMA::ScaleOut::Zero;  // 设置初始累加模式
 
-        typename Softmax::TensorT scores_scale;
+        typename Softmax::TensorT scores_scale;  // 存储softmax缩放因子的张量
 
-        int n_block = n_block_max - 1;
-        // If HasQv, then by the time P is ready, V must have been ready as well
+        // === 主计算循环：从最后一个key块开始向前处理 ===
+        int n_block = n_block_max - 1;  // 从最后一个有效key块开始
+        
+        // === 处理第一个key块 ===
+        // 如果不使用QV流水线，等待V矩阵数据准备就绪
         if constexpr (!HasQv) { pipeline_v.consumer_wait(smem_pipe_read); }
+        
+        // 同步等待P矩阵数据准备完成
         cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
+        
+        // 执行第一次P@V矩阵乘法（zero_init=true表示清零累加器）
         flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+        
+        // 通知P矩阵缓冲区可以重用
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
-        pipeline_v.consumer_release(smem_pipe_read);  // release V
-        --n_block;
+        pipeline_v.consumer_release(smem_pipe_read);  // 释放V矩阵缓冲区
+        --n_block;  // 移到下一个key块
 
-        #pragma unroll 1
+        // === 主循环：处理剩余的key块 ===
+        #pragma unroll 1  // 限制循环展开以控制寄存器使用
         for (; n_block >= n_block_min; --n_block) {
+            // 等待下一个P矩阵准备完成
             cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
+            
+            // 加载当前stage的缩放因子
             load_scales(scores_scale, smem_pipe_read.index());
+            
+            // 使用缩放因子重新缩放之前累积的输出O
+            // 这是Flash Attention算法的关键步骤：在线更新注意力输出
             softmax.rescale_o(tOrO, scores_scale);
+            
+            // 前进到下一个流水线stage
             ++smem_pipe_read;
+            
+            // 如果不使用QV流水线，异步等待下一个V矩阵数据
             if constexpr (!HasQv) {
                 auto barrier_token = pipeline_v.consumer_try_wait(smem_pipe_read);
                 pipeline_v.consumer_wait(smem_pipe_read, barrier_token);
             }
+            
+            // 执行P@V矩阵乘法并累加到输出O中（zero_init=false表示累加模式）
             flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+            
+            // 通知P矩阵缓冲区可以重用
             cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
-            pipeline_v.consumer_release(smem_pipe_read);  // release V
+            pipeline_v.consumer_release(smem_pipe_read);  // 释放V矩阵缓冲区
         };
+        
+        // === 最终处理：应用最后的缩放 ===
         cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
-        load_scales(scores_scale, smem_pipe_read.index());
+        load_scales(scores_scale, smem_pipe_read.index());  // 加载最后的缩放因子
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
-        softmax.rescale_o(tOrO, scores_scale);
+        softmax.rescale_o(tOrO, scores_scale);  // 应用最终缩放
+        
+        // === FP8特殊处理 ===
+        // 如果使用FP8且V矩阵不是列主序，需要重新排列输出
         if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
-        ++smem_pipe_read;
-        return true;
+        
+        ++smem_pipe_read;  // 前进流水线状态
+        return true;       // 返回成功
     }
 
     template <typename SharedStorage>

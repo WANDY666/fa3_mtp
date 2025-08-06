@@ -120,6 +120,7 @@ int round_up(cutlass::FastDivmod const& divmod, int dividend) {
 
 // For SM80, convert acc_layout from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
 // For SM90, convert acc_layout from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
+// (2, 2, 8)
 template<bool Transposed=false, typename Layout0>
 CUTLASS_DEVICE auto convert_layout_acc_rowcol(Layout0 acc_layout) {
     if constexpr (decltype(rank<0>(acc_layout))::value == 3) {  // SM90
