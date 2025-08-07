@@ -440,13 +440,17 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     int const seqlen_k_loaded = !params.is_local
         ? params.seqlen_k
         : std::max(0, std::min(params.seqlen_k, params.window_size_right + params.window_size_left + 1 + kBlockM));
+    // 132
     int const num_n_blocks = (seqlen_k_loaded + kBlockN - 1) / kBlockN;
+    // 1
     int const num_m_blocks = (seqlen_q_packgqa + kBlockM - 1) / kBlockM;
+    // 8448 * (576) * 2 = 9732096
     int const size_one_kv_head = params.seqlen_k * (params.d + params.dv) * (params.is_e4m3 ? 1 : 2);
     // Always enable PackGQA for Split
     // If varlen, we use dynamic split, so this heuristic just needs to get an upper bound on num_splits.
     // We assume the case where there's 1 long sequence and the rest are short, i.e. pretending
     // that batch = 1.
+    // 1 * 1 * 1 = 1
     int total_mblocks = (params.num_splits_dynamic_ptr ? 1 : params.b) * params.h_k * num_m_blocks;
     // 1, 132, 132, 1, 8446 * 1152, false, 128
     return num_splits_heuristic(total_mblocks, params.num_sm, num_n_blocks, num_m_blocks, size_one_kv_head, params.is_causal || params.is_local, 128);

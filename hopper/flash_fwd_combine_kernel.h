@@ -210,7 +210,7 @@ public:
             cutlass::arch::wait_on_dependent_grids();
             *params.semaphore_to_reset = 0;
         }
-        if (num_splits <= 1) { return; }
+        if (num_splits <= 1) { return; } // 这里给退出了所以没有用
         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{batch, size<0>(params.shape_LSE_partial), params.cu_seqlens, params.seqused};
         int const offset = seqlen_info.offset;
         int const seqlen = seqlen_info.seqlen;

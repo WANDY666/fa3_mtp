@@ -147,7 +147,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
     
     // 获取当前线程负责的批次的M和N块数
     int num_m_blocks = get_num_m_blocks(bidb_start); // 1
-    int num_n_blocks = get_num_n_blocks(bidb_start); // 
+    int num_n_blocks = get_num_n_blocks(bidb_start); // 132
 
     // 计算总的注意力块数（M块数 × N块数）
     int total_blocks = num_m_blocks * num_n_blocks; // 1 * 132 = 132
@@ -176,6 +176,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
     // 2. 但不能超过静态分割数的限制
     // 3. 最小为1（不分割）
     // 又除以了，这样翻倍好像也没关系，大概得到1，可能decode模式下num_m_blocks为1，所以total_blocks = num_n_blocks
+    // num_splits_dynamic = (num_n_blocks * num_sm/ (total_blocks * 1.1)) = (num_sm / (num_m_blocks * 1.1)) = (num_sm / (batch_size * 1.1)) 看起来和batch有关系
     int num_splits_dynamic = std::max(std::min((num_n_blocks + blocks_per_sm - 1) / blocks_per_sm, num_splits_static), 1);
     
     // 将计算出的动态分割数写入输出数组
