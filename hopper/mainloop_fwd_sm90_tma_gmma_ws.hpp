@@ -397,6 +397,7 @@ struct CollectiveMainloopFwdSm90 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
+        int const mtp_step = 0;
     };
 
     // Device side kernel params
@@ -454,6 +455,7 @@ struct CollectiveMainloopFwdSm90 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const *const seqlens_rotary = nullptr;
+        cutlass::FastDivmod qhead_per_khead_mtp_divmod;
     };
 
     static Params
@@ -541,6 +543,14 @@ struct CollectiveMainloopFwdSm90 {
         // Avoid dividing by zero
         cutlass::FastDivmod attention_chunk_divmod(args.attention_chunk >= 1 ? args.attention_chunk : 1);
         attention_chunk_divmod.divisor = args.attention_chunk;
+        
+        cutlass::FastDivmod qhead_per_khead_divmod(cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K)));
+
+        cutlass::FastDivmod qhead_per_khead_mtp_divmod = qhead_per_khead_divmod;
+
+        if (args.mtp_step > 0) {
+            qhead_per_khead_mtp_divmod = cutlass::FastDivmod(cute::ceil_div(qhead_per_khead, args.mtp_step + 1));
+        }
         // If there's tanh softcapping, we do tanh(scores * softmax_scale / softcap_val) * softcap_val.
         // Right after this, we multiply by log2(e) before applying exp2.
         // To reduce the number of instructions, we instead pre-multiply softmax_scale / softcap_val
@@ -565,7 +575,9 @@ struct CollectiveMainloopFwdSm90 {
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
+                qhead_per_khead_mtp_divmod
+            };
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -1338,7 +1350,7 @@ struct CollectiveMainloopFwdSm90 {
         // 处理因果掩码、局部注意力窗口、序列长度掩码等
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMmaQK> mask(
             thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
-            params.attention_chunk_divmod, params.qhead_per_khead_divmod
+            params.attention_chunk_divmod, params.qhead_per_khead_divmod, params.qhead_per_khead_mtp_divmod
         );
 
         // === Softcap（软限制）处理 ===

@@ -66,6 +66,7 @@ struct Flash_fwd_params : public Qkv_params {
     int total_q, total_k, total_knew;
     int b_k;  // When having KV cache and with cache_batch_idx, K & V might have larger batch size than Q
     int dv, dv_rounded;  // For the case where V headdim is different from Q/K headdim
+    int mtp_step;
 
     // The scaling factors for the kernel.
     float scale_softmax;

@@ -674,7 +674,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         std::optional<at::Tensor> scheduler_metadata_,  // (b + 1)
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
-        int64_t sm_margin
+        int64_t sm_margin,
+        std::optional<int64_t> mtp_step_
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -886,6 +887,13 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     params.b_k = batch_size_k;
     params.dv = head_size_v;
     params.dv_rounded = head_size_v_rounded;
+    if (mtp_step_.has_value()) {
+        TORCH_CHECK(mtp_step_.value() >= 0, "mtp_step must be greater than 0");
+        params.mtp_step = mtp_step_.value();
+    } else {
+        params.mtp_step = 0;
+    }
+
     if (leftpad_k_.has_value()) {  // This needs to be set before get_pagedkv_tma
         params.leftpad_k = static_cast<int *>(leftpad_k_.value().data_ptr());
     }
@@ -1657,7 +1665,8 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor? scheduler_metadata = None,"
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
-        "int sm_margin = 0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+        "int sm_margin = 0,"
+        "int? mtp_step = 0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"

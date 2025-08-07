@@ -213,6 +213,7 @@ struct CollectiveMainloopFwdSm80 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
+        int const mtp_step = 0;
     };
 
     // Device side kernel params
@@ -259,6 +260,7 @@ struct CollectiveMainloopFwdSm80 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
+        cutlass::FastDivmod qhead_per_khead_mtp_divmod;
     };
 
     static Params
@@ -280,6 +282,14 @@ struct CollectiveMainloopFwdSm80 {
         // Avoid dividing by zero
         cutlass::FastDivmod attention_chunk_divmod(args.attention_chunk >= 1 ? args.attention_chunk : 1);
         attention_chunk_divmod.divisor = args.attention_chunk;
+
+        cutlass::FastDivmod qhead_per_khead_divmod(cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K)));
+
+        cutlass::FastDivmod qhead_per_khead_mtp_divmod = qhead_per_khead_divmod;
+
+        if (args.mtp_step > 0) {
+            qhead_per_khead_mtp_divmod = cutlass::FastDivmod(cute::ceil_div(qhead_per_khead, args.mtp_step + 1));
+        }
         // If there's tanh softcapping, we do tanh(scores * softmax_scale / softcap_val) * softcap_val.
         // Right after this, we multiply by log2(e) before applying exp2.
         // To reduce the number of instructions, we instead pre-multiply softmax_scale / softcap_val
@@ -292,7 +302,7 @@ struct CollectiveMainloopFwdSm80 {
                 args.ptr_rotary_sin, args.stride_rotary_sin, args.is_rotary_interleaved,
                 args.ptr_pagetable, args.shape_pagetable, args.stride_pagetable,
                 cutlass::FastDivmod(int(get<0>(args.shape_K))),
-                cutlass::FastDivmod(cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K))),
+                qhead_per_khead_divmod,
                 !Has_softcap ? float(args.softmax_scale * M_LOG2E) : float(args.softcap_val * M_LOG2E),
                 args.ptr_q_descale, args.ptr_k_descale, args.ptr_v_descale,
                 args.stride_q_descale, args.stride_k_descale, args.stride_v_descale,
@@ -301,7 +311,8 @@ struct CollectiveMainloopFwdSm80 {
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
+                qhead_per_khead_mtp_divmod};
     }
 
     template <typename SharedStorage, typename FrgTensorO, typename Softmax>
@@ -552,7 +563,7 @@ struct CollectiveMainloopFwdSm80 {
 
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMma> mask(
             thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
-            params.attention_chunk_divmod, params.qhead_per_khead_divmod
+            params.attention_chunk_divmod, params.qhead_per_khead_divmod, params.qhead_per_khead_mtp_divmod
         );
 
         float softcap_val = params.softcap_val;

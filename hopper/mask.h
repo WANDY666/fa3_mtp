@@ -36,6 +36,7 @@ struct Mask {
     int const sink_token_length;                      // sink token长度（可以全局访问的特殊token数量）
     cutlass::FastDivmod const attention_chunk_divmod; // attention chunk的除法器（用于chunked attention）
     cutlass::FastDivmod const qhead_per_khead_divmod; // Q head到K head的映射除法器（用于GQA）
+    cutlass::FastDivmod const qhead_per_khead_mtp_divmod;  // MTP size的除法器
 
     /**
      * 构造函数：初始化mask计算所需的所有参数
@@ -44,7 +45,8 @@ struct Mask {
     Mask(const int thread_idx, const int seqlen_q, const int seqlen_k,
          const int window_size_left, const int window_size_right, const int sink_token_length,
          cutlass::FastDivmod const &attention_chunk_divmod,
-         cutlass::FastDivmod const &qhead_per_khead_divmod)
+         cutlass::FastDivmod const &qhead_per_khead_divmod,
+         cutlass::FastDivmod const &qhead_per_khead_mtp_divmod = cutlass::FastDivmod())
         : thread_idx(thread_idx)
         , seqlen_q(seqlen_q)
         , seqlen_k(seqlen_k)
@@ -53,6 +55,7 @@ struct Mask {
         , sink_token_length(sink_token_length)
         , attention_chunk_divmod(attention_chunk_divmod)
         , qhead_per_khead_divmod(qhead_per_khead_divmod)
+        , qhead_per_khead_mtp_divmod(qhead_per_khead_mtp_divmod.divisor == 1 ? qhead_per_khead_divmod : qhead_per_khead_mtp_divmod)
     {
     };
 
@@ -153,24 +156,21 @@ struct Mask {
         // 减去当前线程的列偏移，得到相对于线程0的列限制
         int const thread_col_offset = get<Col>(tScS_rowcol(_0{}, _0{}));
         // 减去 thread_col_offset 是为了获得相对于这个 64 * 64 块的列限制
-        int const seqlenk_col_limit = seqlen_k - n_block * kBlockN - thread_col_offset;
-        int const seqlenk_col_limit_0 = seqlenk_col_limit - 1;
+        int const seqlenk_col_limit = seqlen_k - n_block * kBlockN - thread_col_offset - qhead_per_khead_mtp_divmod.divide(qhead_per_khead_divmod.divisor) + 1;
         
         // === 应用不同类型的mask ===
         if constexpr (!Causal_mask && !Local_mask) {
             // === 情况1：只需要序列长度mask ===
             if constexpr (Seqlenk_mask) {
-                // 简单的列mask：如果列索引超出序列长度，mask整列
-                #pragma unroll
-                // 遍历当前线程负责的所有列（Key tokens）32 >> 2 = 16
-                int const qhead_per_khead_half = qhead_per_khead_divmod.divisor >> 1;
-
                 // 遍历当前线程负责的所有行（Query tokens）
+                #pragma unroll
                 for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
                     // 获取当前行索引
                     int const row_idx = get<Row>(tScS_rowcol(m, _0{}));
+                    int const mtp_index = qhead_per_khead_mtp_divmod.divide(row_idx);
                     // 根据行索引判断是否需要减1
-                    int const seqlenk_col_limit_mtp = (row_idx < qhead_per_khead_half) ? seqlenk_col_limit_0 : seqlenk_col_limit;
+                    int const seqlenk_col_limit_mtp = seqlenk_col_limit + mtp_index;
+                    #pragma unroll
                     for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
                         if (int(get<Col>(t0ScS_rowcol(_0{}, n))) >= seqlenk_col_limit_mtp) {
                             tSrS_rowcol(m, n) = -INFINITY;  // 设置为负无穷，softmax后变为0
